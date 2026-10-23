@@ -25,6 +25,7 @@ class DICOMReader:
         self,
         directory: str | Path,
         progress_callback: ProgressCallback | None = None,
+        rasterize_structures: list[str]|bool = False,
     ) -> Dataset:
         """
         Read available CT, RTDOSE, RTSTRUCT, and RTPLAN data from a DICOM directory.
@@ -55,26 +56,33 @@ class DICOMReader:
             except (FileNotFoundError, RuntimeError, InvalidDicomError, OSError, ValueError) as e:
                 logger.warning("Could not read CT: %s", e)
 
-            self._emit_progress(10, "Reading dose image")
-            try:
-                dose_image, dose_metadata = self.read_dose(directory)
-                if dataset.ct_image is not None:
-                    dose_image = Resample.dose(dose_image, dataset.ct_image)
-                else:
-                    logger.warning("RTDOSE was read, but CT is missing so dose was not resampled.")
-                dataset.dose_image = dose_image
-                dataset.dose_metadata = dose_metadata
-            except (FileNotFoundError, RuntimeError, InvalidDicomError, OSError, ValueError) as e:
-                logger.warning("Could not read RTDOSE: %s", e)
-
+            #Read Structures
             self._emit_progress(15, "Reading structures")
-            if dataset.ct_image is not None:
-                try:
-                    dataset.structures = self.read_structure(directory, dataset.ct_image)
-                except (FileNotFoundError, RuntimeError, InvalidDicomError, OSError, ValueError) as e:
-                    logger.warning("Could not read RTSTRUCT: %s", e)
-            else:
-                logger.warning("Skipping RTSTRUCT because CT is missing.")
+            try:
+                dataset.rtstruct = self.read_rtstruct(directory)
+
+            except (FileNotFoundError, RuntimeError, InvalidDicomError, OSError, ValueError) as e:
+                logger.warning("Could not read RTSTRUCT: %s", e)
+
+
+            #if user wants to rasterize structures, do it now
+            if rasterize_structures:
+                #make list of structures to rasterize
+                if rasterize_structures is True:
+                    structures_to_rasterize = dataset.structure_names
+                else:
+                    structures_to_rasterize=rasterize_structures
+
+                for structure_name in structures_to_rasterize:
+                    try:
+                        self.get_rasterized_structure(dataset, structure_name)
+                    except (ValueError, RuntimeError) as e:
+                        #empty structures are normal, skip them
+                        if "No contours found" in str(e):
+                            continue
+
+                        logger.warning("Could not rasterize structure '%s': %s", structure_name, e)
+                
 
             self._emit_progress(95, "Reading plan")
             try:
@@ -116,20 +124,99 @@ class DICOMReader:
 
         return dose_image, dose_metadata
 
-    def read_structure(
+    def get_dose_image(
+        self,
+        dataset:Dataset,
+        )->sitk.Image:
+        """
+        Returns the dose image for a Dataset, if the dose has already been loaded, return the cached image
+        """
+
+        if dataset.dose_image is not None:
+            return dataset.dose_image
+
+        dose_image, dose_metadata=self.read_dose(dataset.directory)
+
+        dose_image=Resample.dose(moving_image=dose_image,
+                                 fixed_image=dataset.ct_image)
+
+        dataset.dose_image = dose_image
+        dataset.dose_metadata = dose_metadata
+
+        return dataset.dose_image
+
+    def read_rtstruct(
         self,
         directory: str | Path,
-        ct_image: sitk.Image,
-    ) -> dict[str, Structure]:
+    ) -> pydicom.dataset.FileDataset:
         """
-        Read the RTSTRUCT from a DICOM directory and convert its contours into
-        binary mask images.
+        Read the raw RTSTRUCT DICOM object without creating structure masks.
         """
         rtstruct_file = self._find_file_by_modality(directory, "RTSTRUCT")
-        rtstruct = pydicom.dcmread(str(rtstruct_file), stop_before_pixels=True)
+        return pydicom.dcmread(str(rtstruct_file), stop_before_pixels=True)
 
-        structure_masks = self._get_all_structure_masks(rtstruct, ct_image)
-        return self._structure_masks_to_structures(structure_masks, ct_image)
+
+    def get_rasterized_structure(
+            self,
+            dataset: Dataset,
+            structure_name: str,
+    )->Structure:
+        """
+        Returns one RTStruct structure as a rasterized binary mask image, given the structure name. Attaches it to the dataset if it has not been rasterized yet.
+        If the structure has already been rasterized, return the cached Stucture object instead of rasterising again
+        """
+
+        #can't rasterize onto ct if there is no ct
+        if dataset.ct_image is None:
+            raise ValueError("CT image must be available in the dataset to rasterize structures.")
+
+        if dataset.rtstruct is None:
+            raise ValueError("Dataset does not contain an RTSTRUCT.")
+        
+        #clean the requested name
+        cleaned_name = Structure.generate_clean_name(structure_name)
+
+        #if the structure has already been rasterized, just return it now
+
+        if cleaned_name in dataset.rasterized_structures:
+            return dataset.rasterized_structures[cleaned_name]
+
+        #otherwise, we need to rasterize the structure and add it to the dataset
+        #Map RT STRUCT ROI names to numbers
+        roi_name_to_number = self._get_roi_name_to_number(dataset.rtstruct)
+
+        #get the roi_number and import_name (aka uncleaned name) for the requested structure
+        import_name = None
+        roi_number=None
+        for name, number in roi_name_to_number.items():
+            if Structure.generate_clean_name(name) == cleaned_name:
+                import_name = name
+                roi_number = number
+                break
+        if roi_number is None:
+            raise ValueError(f"Structure '{structure_name}' not found in RTSTRUCT.")
+
+
+        #get the contour sequence for the requested structure
+        contour_seq=self._get_contour_sequence(dataset.rtstruct, roi_number)
+        if not contour_seq:
+            raise ValueError(f"No contours found for structure '{structure_name}'.")
+
+        #Rasterize the structure onto a binary mask
+        mask, _ = self._get_structure_mask(
+            ct_image=dataset.ct_image,
+            contour_seq=contour_seq,
+            structure_name=import_name,
+        )
+
+        #convert the numpy binary mask into a structure object
+        structure = self._create_structure(import_name, mask, dataset.ct_image)
+
+        #cache the rasterized structure in the dataset for future use
+        dataset.rasterized_structures[cleaned_name] = structure
+
+        return structure
+
 
     def read_plan(
         self,
@@ -215,69 +302,31 @@ class DICOMReader:
 
         return roi_name_to_number
 
-    def _get_contour_by_roi_number(
-        self,
-        rtstruct: pydicom.dataset.Dataset,
-    ) -> tuple[dict[int, list], int]:
-        """Map ROI numbers to contour sequences and count the total contours."""
-        contour_by_roi_number: dict[int, list] = {}
-        total_contours = 0
 
-        for contour in getattr(rtstruct, "ROIContourSequence", []):
-            roi_number = getattr(contour, "ReferencedROINumber", None)
-            contour_seq = getattr(contour, "ContourSequence", None)
+    def _get_contour_sequence(
+            self,
+            rtstruct: pydicom.dataset.Dataset,
+            roi_number: int
+    ):
+        """
+        Return contour sequence belonging to an roi number
+        """
 
-            if roi_number is None or not contour_seq:
+        #loop through all roi_contours in the rtstruct
+        for roi_contour in getattr(rtstruct, "ROIContourSequence", []): #gettr returns the sequence if it exists, else returns empty list
+            
+            referenced_roi_number = getattr(roi_contour, "ReferencedROINumber", None) #get the roi number for this contour
+
+            if referenced_roi_number is None:
                 continue
 
-            contour_by_roi_number[int(roi_number)] = contour_seq
-            total_contours += len(contour_seq)
+            if int(referenced_roi_number) == roi_number: #if the roi number matches the requested one
+                return getattr(roi_contour, "ContourSequence", []) #return the contour sequence for this roi number
+            # if we reach here, it means the roi number did not match, so we continue to the next roi_contour
 
-        return contour_by_roi_number, total_contours
-
-    def _get_all_structure_masks(
-        self,
-        rtstruct: pydicom.dataset.Dataset,
-        ct_image: sitk.Image,
-    ) -> dict[str, np.ndarray]:
-        """Rasterize all RTSTRUCT contours into binary mask arrays."""
-        roi_name_to_number = self._get_roi_name_to_number(rtstruct)
-        contour_by_roi_number, total_contours = self._get_contour_by_roi_number(rtstruct)
-
-        masks: dict[str, np.ndarray] = {}
-
-        if total_contours == 0:
-            logger.warning("No contours found in RTSTRUCT.")
-            self._emit_progress(95, "No contours found")
-            return masks
-
-        processed_contours = 0
-        start_percent = 15
-        end_percent = 95
-        span = end_percent - start_percent
-
-        for structure_name, roi_number in roi_name_to_number.items():
-            contour_seq = contour_by_roi_number.get(int(roi_number))
-            if not contour_seq:
-                continue
-
-            try:
-                mask, done = self._get_structure_mask(
-                    ct_image=ct_image,
-                    contour_seq=contour_seq,
-                    structure_name=structure_name,
-                    processed_contours=processed_contours,
-                    total_contours=total_contours,
-                    start_percent=start_percent,
-                    span=span,
-                )
-                masks[structure_name] = mask
-                processed_contours = done
-            except Exception as e:
-                logger.warning("Could not rasterize structure %s: %s", structure_name, e)
-                continue
-
-        return masks
+        #if we reach here, it means we did not find a matching roi number
+        return None
+    
 
     def _get_structure_mask(
         self,
@@ -290,7 +339,10 @@ class DICOMReader:
         span: int = 80,
     ) -> tuple[np.ndarray, int]:
         """Rasterize a single RTSTRUCT contour sequence into a binary mask."""
-        mask = np.zeros(sitk.GetArrayFromImage(ct_image).shape, dtype=np.uint8)
+
+        #numpy array shape is (z,y,x) but sitk shape is (x,y,z) so we need to reverse the sitk shape to get the numpy shape
+        mask = np.zeros(tuple(reversed(ct_image.GetSize())), dtype=np.uint8) 
+
 
         for contour in contour_seq:
             contour_data = getattr(contour, "ContourData", None)
@@ -319,20 +371,6 @@ class DICOMReader:
 
         return mask, processed_contours
 
-    def _structure_masks_to_structures(
-        self,
-        structure_masks: dict[str, np.ndarray],
-        ct_image: sitk.Image,
-    ) -> dict[str, Structure]:
-        """Convert structure mask arrays into Structure objects."""
-        structures: dict[str, Structure] = {}
-
-        for import_name, mask in structure_masks.items():
-            structure = self._create_structure(import_name, mask, ct_image)
-            structures[structure.cleaned_name] = structure
-
-        return structures
-
     def _create_structure(
         self,
         import_name: str,
@@ -346,9 +384,8 @@ class DICOMReader:
     def _mask_to_sitk(self, mask: np.ndarray, ct_image: sitk.Image) -> sitk.Image:
         """Convert a NumPy mask to a SimpleITK image using CT geometry."""
         image = sitk.GetImageFromArray(mask.astype(np.uint8))
-        image.SetOrigin(ct_image.GetOrigin())
-        image.SetSpacing(ct_image.GetSpacing())
-        image.SetDirection(ct_image.GetDirection())
+        image.CopyInformation(ct_image)
+
         return image
 
     def _emit_progress(self, percent: int, message: str) -> None:

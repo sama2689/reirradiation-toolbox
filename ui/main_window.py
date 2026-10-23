@@ -136,8 +136,8 @@ class MainWindow(QMainWindow):
             fixed_image = self.fixed_dataset.ct_image
             moving_image = self.moving_dataset.ct_image
 
-            fixed_names = sorted(self.fixed_dataset.structures.keys())
-            moving_names = sorted(self.moving_dataset.structures.keys())
+            fixed_names = sorted(self.fixed_dataset.rasterized_structures.keys())
+            moving_names = sorted(self.moving_dataset.rasterized_structures.keys())
             preview_context = {
                 "fixed_image": fixed_image,
                 "moving_image": moving_image,

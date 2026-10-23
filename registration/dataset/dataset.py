@@ -23,12 +23,14 @@ class Dataset:
         Radiotherapy dose distribution in SimpleITK format.
     dose_scaling:
         Scaling factor to convert raw dose values to physical units (Gy).
-    structures:
+    rasterized_structures:
         Dictionary mapping cleaned structure names to Structure objects.
     ct_metadata:
         DICOM metadata of the CT image.
     dose_metadata:
         DICOM metadata of the dose distribution image.
+    rtstruct:
+        DICOM RT Structure file.
     plan:
         DICOM RT Plan file.
     """
@@ -38,12 +40,15 @@ class Dataset:
     # images
     ct_image: sitk.Image              | None = None
     dose_image: sitk.Image            | None = None
-    structures: dict[str, Structure]  = field(default_factory=dict)
+    rasterized_structures: dict[str, Structure]  = field(default_factory=dict)
+    
     
     # metadata
     ct_metadata: pydicom.dataset.FileDataset   | None = None
     dose_metadata: pydicom.dataset.FileDataset | None = None
+    rtstruct: pydicom.dataset.FileDataset | None = None
     plan: pydicom.dataset.FileDataset          | None = None
+    
 
     # unique identifier
     id: UUID = field(default_factory=uuid4)
@@ -69,6 +74,19 @@ class Dataset:
                 return float(dose)
 
         return None
+    @property 
+    def structure_names(self) -> list[str]:
+
+        #sends all string names of rtstruct to a property of the dataclass
+        if self.rtstruct is None:
+            return []
+        
+        names=[]
+        for roi in self.rtstruct.StructureSetROISequence:
+            names.append(str(roi.ROIName)) 
+
+        return names
+
 
 @dataclass
 class Structure:
@@ -78,7 +96,7 @@ class Structure:
     Attributes
     ----------
     import_name:
-        The name the structure was assigned based on the import.
+        The name the structure was assigned based on the import. This is the name exactly as it is in a RTSTRUCT file.
     image:
         The SimpleITK mask image of the structure.
     display_name:

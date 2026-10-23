@@ -43,12 +43,12 @@ class DatasetWriter:
                 dataset.plan.save_as(str(plan_path))
 
         # structures
-        if dataset.structures:
+        if dataset.rasterized_structures:
             structures_metadata = {
                 "structures": []
             }
 
-            for structure in dataset.structures.values():
+            for structure in dataset.rasterized_structures.values():
                 file_name = f"{structure.id}.nii.gz"
                 structure_path = self.structures_directory / file_name
 

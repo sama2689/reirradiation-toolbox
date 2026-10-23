@@ -41,7 +41,7 @@ class DatasetReader:
         dataset = Dataset(
             ct_image=ct_image,
             dose_image=dose_image,
-            structures=structures,
+            rasterized_structures=structures,
             ct_metadata=ct_metadata,
             dose_metadata=dose_metadata,
             plan=plan,

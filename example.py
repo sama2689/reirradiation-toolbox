@@ -23,13 +23,13 @@ dose_example = DICOMReader().read_dose(directory=fixed_path)  # returns a tuple 
 
 fixed_ct = fixed_dataset.ct_image
 fixed_dose = fixed_dataset.dose_image
-fixed_structures = fixed_dataset.structures
+fixed_structures = fixed_dataset.rasterized_structures
 fixed_rtplan = fixed_dataset.plan
 
 
 # the structure names in the dict are cleaned to be lower case and spaces be _, so individual ones can be accessed:
 
-fixed_cord = fixed_dataset.structures["cord"]
+fixed_cord = fixed_dataset.rasterized_structures["cord"]
 fixed_cord_mask = fixed_cord.image  # .image returns the rasterised mask that can be used for doses/contour visualisation
 
 
@@ -38,7 +38,7 @@ fixed_cord_mask = fixed_cord.image  # .image returns the rasterised mask that c
 from registration.methods.masking import Masking
 
 fixed_mask = Masking().contour_mask(
-    contour=fixed_dataset.structures["body"].image,
+    contour=fixed_dataset.rasterized_structures["body"].image,
     dilation=1,
     erosion=0,
 )
@@ -105,7 +105,7 @@ rigid_dose = Resample().dose(
     transform=rigid_transform
 )
 rigid_structures = Resample().structure_set(
-    structures=moving_dataset.structures,
+    structures=moving_dataset.rasterized_structures,
     reference_image=fixed_dataset.ct_image,
     transform=rigid_transform,
 )
@@ -154,7 +154,7 @@ demons_dose = Resample().dose(
     transform=demons_transform
 )
 demons_structures = Resample().structure_set(
-    structures=moving_dataset.structures,
+    structures=moving_dataset.rasterized_structures,
     reference_image=fixed_dataset.ct_image,
     transform=demons_transform,
 )
